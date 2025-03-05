@@ -1,310 +1,181 @@
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::pubkey::Pubkey;
 
-declare_id!("4B6SCjBKMUvBzv5epJK7GeVfHGwGZb5EdEVxGbZakb7u");
+declare_id!("Gnm44jNsMtxvkEvpxqZ7FCGdNaTeMKVhv1VaiyX1nVPQ");
 
 #[program]
 pub mod liquidity_pool {
     use super::*;
 
-    // create a new pool
-    pub fn create_pool(
-        ctx: Context<CreatePool>,
-        currency: [u8; 3], // Fixed-size array for currency
-        initial_liquidity: u64,
-    ) -> Result<()> {
-        let pool = &mut ctx.accounts.pool;
-        pool.currency = currency;
-        pool.total_liquidity = initial_liquidity;
-        pool.status = PoolStatus::Active;
-        pool.bump = ctx.bumps.pool; // Access the bump directly
-        Ok(())
-    }
-
-      
-       pub fn create_maker(ctx: Context<CreateMaker>) -> Result<()> {
-        let maker = &mut ctx.accounts.maker;
-        maker.authority = ctx.accounts.authority.key();
-        maker.verified_status = MakerStatus::Pending; 
-        maker.bump = ctx.bumps.maker; 
-        Ok(())
-    }
-
-     
-       pub fn create_contribution(ctx: Context<CreateContribution>) -> Result<()> {
-        let contribution = &mut ctx.accounts.contribution;
-        contribution.pool = ctx.accounts.pool.key();
-        contribution.maker = ctx.accounts.maker.key();
-        contribution.amount = 0; 
-        contribution.bump = ctx.bumps.contribution;
-        Ok(())
-    }
-
-   
-    pub fn create_transaction(ctx: Context<CreateTransaction>) -> Result<()> {
-        let transaction = &mut ctx.accounts.transaction;
-        transaction.pool = ctx.accounts.pool.key();
-        transaction.maker = ctx.accounts.maker.key();
-        transaction.transaction_type = TransactionType::Deposit; 
-        transaction.amount = 0; 
-        transaction.status = TransactionStatus::Pending; 
-        transaction.bump = ctx.bumps.transaction;
-        Ok(())
-    }
-
-    pub fn verify_maker(ctx: Context<VerifyMaker>) -> Result<()> {
-        let maker = &mut ctx.accounts.maker;
-        maker.verified_status = MakerStatus::Verified;
-        Ok(())
-    }
-
-//deposit funds into a pool
-    pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
-        let pool = &mut ctx.accounts.pool;
-        let maker = &mut ctx.accounts.maker;
-        let contribution = &mut ctx.accounts.contribution;
-    
-        require!(maker.verified_status == MakerStatus::Verified, ErrorCode::MakerNotVerified);
-    
-        pool.total_liquidity += amount;
-        contribution.amount += amount;
-    
-        let transaction = &mut ctx.accounts.transaction;
-        transaction.transaction_type = TransactionType::Deposit;
-        transaction.amount = amount;
-        transaction.status = TransactionStatus::Completed;
-        transaction.bump = ctx.bumps.transaction;
-    
-        Ok(())
-    }
-  // withdraw funds from a pool
-    pub fn withdraw(
-        ctx: Context<Withdraw>,
+    pub fn deposit_funds(
+        ctx: Context<DepositFunds>,
         amount: u64,
+        exchange_rate: u64,
+        nonce: u64,
     ) -> Result<()> {
-        let pool = &mut ctx.accounts.pool;
-        let maker = &mut ctx.accounts.maker;
-        let contribution = &mut ctx.accounts.contribution;
-
-        // Verify maker status
-        require!(maker.verified_status == MakerStatus::Verified, ErrorCode::MakerNotVerified);
-
-      
-        require!(contribution.amount >= amount, ErrorCode::InsufficientFunds);
-
-       
-        pool.total_liquidity -= amount;
-
-       
-        contribution.amount -= amount;
-
-        // Record transaction
         let transaction = &mut ctx.accounts.transaction;
-        transaction.transaction_type = TransactionType::Withdrawal;
+        let taker = &ctx.accounts.taker;
+
+        transaction.taker = taker.key();
         transaction.amount = amount;
-        transaction.status = TransactionStatus::Completed;
-        transaction.bump = ctx.bumps.transaction; 
+        transaction.exchange_rate = exchange_rate;
+        transaction.status = TransactionStatus::Pending;
+        transaction.nonce = nonce;
+        transaction.bump = ctx.bumps.transaction;
+
+        let cpi_accounts = anchor_spl::token::Transfer {
+            from: ctx.accounts.taker_token_account.to_account_info(),
+            to: ctx.accounts.program_token_account.to_account_info(),
+            authority: ctx.accounts.taker.to_account_info(),
+        };
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+        anchor_spl::token::transfer(cpi_ctx, amount)?;
+
+        Ok(())
+    }
+
+    pub fn accept_offer(ctx: Context<AcceptOffer>) -> Result<()> {
+        let transaction = &mut ctx.accounts.transaction;
+
+        require!(
+            transaction.status == TransactionStatus::Pending,
+            ErrorCode::OfferNotPending
+        );
+
+        transaction.status = TransactionStatus::Accepted;
+
+        let cpi_accounts = anchor_spl::token::Transfer {
+            from: ctx.accounts.program_token_account.to_account_info(),
+            to: ctx.accounts.maker_token_account.to_account_info(),
+            authority: ctx.accounts.program_token_pda.to_account_info(), // Use program_token_pda
+        };
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let seeds = &[b"program_token_account" as &[u8], &[ctx.bumps.program_token_pda]];
+        let signer = &[&seeds[..]];
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
+        anchor_spl::token::transfer(cpi_ctx, transaction.amount)?;
+
+        Ok(())
+    }
+
+    pub fn cancel_offer(ctx: Context<CancelOffer>) -> Result<()> {
+        let transaction = &mut ctx.accounts.transaction;
+
+        require!(
+            transaction.status == TransactionStatus::Pending,
+            ErrorCode::OfferNotPending
+        );
+
+        transaction.status = TransactionStatus::Canceled;
+
+        let cpi_accounts = anchor_spl::token::Transfer {
+            from: ctx.accounts.program_token_account.to_account_info(),
+            to: ctx.accounts.taker_token_account.to_account_info(),
+            authority: ctx.accounts.program_token_pda.to_account_info(), // Use program_token_pda
+        };
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let seeds = &[b"program_token_account" as &[u8], &[ctx.bumps.program_token_pda]];
+        let signer = &[&seeds[..]];
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
+        anchor_spl::token::transfer(cpi_ctx, transaction.amount)?;
 
         Ok(())
     }
 }
 
-
-
 #[derive(Accounts)]
-pub struct CreateMaker<'info> {
+#[instruction(amount: u64, exchange_rate: u64, nonce: u64)]
+pub struct DepositFunds<'info> {
     #[account(
         init,
-        payer = authority,
-        space = 8 + std::mem::size_of::<Maker>(),
-        seeds = [b"maker", authority.key().as_ref()],
-        bump
-    )]
-    pub maker: Account<'info, Maker>,
-    #[account(mut)]
-    pub authority: Signer<'info>,
-    pub system_program: Program<'info, System>,
-}
-
-
-
-
-#[derive(Accounts)]
-#[instruction(currency: [u8; 3])] // Pass the currency argument
-pub struct CreatePool<'info> {
-    #[account(
-        init,
-        payer = authority,
-        space = 8 + std::mem::size_of::<Pool>(),
-        seeds = [b"pool", currency.as_ref()], // Use the currency argument
-        bump
-    )]
-    pub pool: Account<'info, Pool>,
-    #[account(mut)]
-    pub authority: Signer<'info>,
-    pub system_program: Program<'info, System>,
-}
-
-
-
-#[derive(Accounts)]
-pub struct CreateContribution<'info> {
-    #[account(
-        init,
-        payer = authority,
-        space = 8 + std::mem::size_of::<PoolContribution>(),
-        seeds = [b"contribution", pool.key().as_ref(), maker.key().as_ref()],
-        bump
-    )]
-    pub contribution: Account<'info, PoolContribution>,
-    #[account(mut)]
-    pub pool: Account<'info, Pool>,
-    #[account(mut)]
-    pub maker: Account<'info, Maker>,
-    #[account(mut)]
-    pub authority: Signer<'info>,
-    pub system_program: Program<'info, System>,
-}
-
-
-#[derive(Accounts)]
-pub struct CreateTransaction<'info> {
-    #[account(
-        init,
-        payer = authority,
+        payer = taker,
         space = 8 + std::mem::size_of::<Transaction>(),
-        seeds = [b"transaction", pool.key().as_ref(), maker.key().as_ref()],
+        seeds = [b"transaction", taker.key().as_ref(), &nonce.to_le_bytes()],
         bump
     )]
     pub transaction: Account<'info, Transaction>,
     #[account(mut)]
-    pub pool: Account<'info, Pool>,
+    pub taker: Signer<'info>,
     #[account(mut)]
-    pub maker: Account<'info, Maker>,
+    pub taker_token_account: Account<'info, anchor_spl::token::TokenAccount>,
     #[account(mut)]
-    pub authority: Signer<'info>,
+    pub program_token_account: Account<'info, anchor_spl::token::TokenAccount>,
+    pub token_program: Program<'info, anchor_spl::token::Token>,
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
-pub struct VerifyMaker<'info> {
-    #[account(mut, seeds = [b"maker", authority.key().as_ref()], bump)]
-    pub maker: Account<'info, Maker>,
-    #[account(mut)]
-    pub authority: Signer<'info>,
-}
-
-
-
-#[derive(Accounts)]
-pub struct Deposit<'info> {
-    #[account(mut)]
-    pub pool: Account<'info, Pool>,
-    #[account(mut)]
-    pub maker: Account<'info, Maker>,
-    #[account(mut, has_one = pool, has_one = maker)]
-    pub contribution: Account<'info, PoolContribution>,
-    #[account(
-        mut, //  mutable 
-        seeds = [b"transaction", pool.key().as_ref(), maker.key().as_ref()],
-        bump
-    )]
-    pub transaction: Account<'info, Transaction>,
-    #[account(mut)]
-    pub authority: Signer<'info>,
-    pub system_program: Program<'info, System>,
-}
-// Accounts for Withdraw instruction
-#[derive(Accounts)]
-pub struct Withdraw<'info> {
-    #[account(mut)]
-    pub pool: Account<'info, Pool>,
-    #[account(mut)]
-    pub maker: Account<'info, Maker>,
-    #[account(mut, has_one = pool, has_one = maker)]
-    pub contribution: Account<'info, PoolContribution>,
+pub struct AcceptOffer<'info> {
     #[account(
         mut,
-        seeds = [b"transaction", pool.key().as_ref(), maker.key().as_ref()],
+        has_one = taker,
+        seeds = [b"transaction", taker.key().as_ref(), &transaction.nonce.to_le_bytes()],
+        bump = transaction.bump
+    )]
+    pub transaction: Account<'info, Transaction>,
+    /// CHECK: This is not a signer or writable account; it’s just a reference to the taker’s public key, validated by the transaction account’s has_one constraint.
+    pub taker: AccountInfo<'info>,
+    #[account(mut)]
+    pub maker: Signer<'info>,
+    #[account(mut)]
+    pub maker_token_account: Account<'info, anchor_spl::token::TokenAccount>,
+    #[account(mut)]
+    pub program_token_account: Account<'info, anchor_spl::token::TokenAccount>,
+    #[account(
+        seeds = [b"program_token_account"],
         bump
     )]
-    pub transaction: Account<'info, Transaction>, // Remove `init`, make mutable
+    /// CHECK: This is a PDA derived from "program_token_account" seeds and bump, used as the authority for token transfers; its validity is ensured by the seeds and bump constraints.
+    pub program_token_pda: AccountInfo<'info>,
+    pub token_program: Program<'info, anchor_spl::token::Token>,
+}
+
+#[derive(Accounts)]
+pub struct CancelOffer<'info> {
+    #[account(
+        mut,
+        has_one = taker,
+        seeds = [b"transaction", taker.key().as_ref(), &transaction.nonce.to_le_bytes()],
+        bump = transaction.bump
+    )]
+    pub transaction: Account<'info, Transaction>,
     #[account(mut)]
-    pub authority: Signer<'info>,
-    pub system_program: Program<'info, System>,
+    pub taker: Signer<'info>,
+    #[account(mut)]
+    pub taker_token_account: Account<'info, anchor_spl::token::TokenAccount>,
+    #[account(mut)]
+    pub program_token_account: Account<'info, anchor_spl::token::TokenAccount>,
+    #[account(
+        seeds = [b"program_token_account"],
+        bump
+    )]
+    /// CHECK: This is a PDA derived from "program_token_account" seeds and bump, used as the authority for token transfers; its validity is ensured by the seeds and bump constraints.
+    pub program_token_pda: AccountInfo<'info>,
+    pub token_program: Program<'info, anchor_spl::token::Token>,
 }
-
-
-
-// Pool account
-#[account]
-pub struct Pool {
-    pub currency: [u8; 3], // Fixed-size array for currency
-    pub total_liquidity: u64,
-    pub status: PoolStatus,
-    pub bump: u8,
-}
-
-// Maker account
-#[account]
-pub struct Maker {
-    pub authority: Pubkey,
-    pub verified_status: MakerStatus,
-    pub bump: u8,
-}
-
-// PoolContribution account
-#[account]
-pub struct PoolContribution {
-    pub pool: Pubkey,
-    pub maker: Pubkey,
-    pub amount: u64,
-    pub bump: u8,
-}
-
 
 #[account]
 pub struct Transaction {
-    pub pool: Pubkey,
-    pub maker: Pubkey,
-    pub transaction_type: TransactionType,
+    pub taker: Pubkey,
     pub amount: u64,
+    pub exchange_rate: u64,
     pub status: TransactionStatus,
+    pub nonce: u64,
     pub bump: u8,
-}
-
-// Enums
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
-pub enum PoolStatus {
-    Active,
-    Paused,
-    Closed,
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
-pub enum MakerStatus {
-    Verified,
-    Pending,
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
-pub enum TransactionType {
-    Deposit,
-    Withdrawal,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
 pub enum TransactionStatus {
     Pending,
-    Completed,
-    Failed,
+    Accepted,
+    Canceled,
 }
-
 
 #[error_code]
 pub enum ErrorCode {
-    #[msg("Maker is not verified")]
-    MakerNotVerified,
     #[msg("Insufficient funds")]
     InsufficientFunds,
+    #[msg("Offer is not pending")]
+    OfferNotPending,
 }
